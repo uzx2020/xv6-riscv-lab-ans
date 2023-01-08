@@ -10,10 +10,7 @@ cd xv6-labs-2022
 # lab3-page tables
 
 # lab4-traps
-  $ git fetch
   
-  $ git checkout traps
+git checkout traps
   
-  $ make clean
-  
-  $ git apply lab_trap.patch
+git apply lab_trap.patch
