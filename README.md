@@ -12,6 +12,9 @@ cd xv6-labs-2022
 
 # lab4-traps
   $ git fetch
+  
   $ git checkout traps
+  
   $ make clean
+  
   $ git apply lab_trap.patch
