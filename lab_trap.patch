@@ -1,0 +1,257 @@
+diff --git a/Makefile b/Makefile
+index ded5bc2..2628613 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,6 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_alarmtest\
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..3ad957a 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,7 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
+-
++void            backtrace();
+ // proc.c
+ int             cpuid(void);
+ void            exit(int);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index 1a50203..de513cc 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -133,3 +133,28 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++
++uint64 get_ra(uint64 fp)
++{
++  uint64 *p = (uint64 *)(fp - 8);
++  return *p;
++}
++
++uint64 get_prev_fp(uint64 fp)
++{
++  uint64 *p = (uint64 *)(fp - 16);
++  return *p;
++}
++
++void backtrace()
++{
++  uint64 fp = r_fp();
++  uint64 fp_boundary = PGROUNDDOWN(fp);
++
++  printf("backtrace:\n");
++  while (fp >= fp_boundary) {
++    printf("%p\n", get_ra(fp));
++    fp = get_prev_fp(fp);
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..58bfd1a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -132,6 +132,14 @@ found:
+     return 0;
+   }
+ 
++  // Allocate a trapframe for user callback
++  if((p->alarm_frame = (struct trapframe *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  p->userfunc_running = 0;
++
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -157,7 +165,11 @@ freeproc(struct proc *p)
+ {
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
++  if (p->alarm_frame) {
++    kfree((void *)p->alarm_frame);
++  }
+   p->trapframe = 0;
++  p->alarm_frame = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..8b3462e 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,5 +103,12 @@ struct proc {
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
++
++  int interval;
++  int ticks_passed;
++  uint64 userfunc;
++  int userfunc_running;
++  struct trapframe *alarm_frame;
++
+   char name[16];               // Process name (debugging)
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..5ccee95 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -327,6 +327,14 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ typedef uint64 pte_t;
+ typedef uint64 *pagetable_t; // 512 PTEs
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..e4f006a 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm]   sys_sigalarm,
++[SYS_sigreturn]   sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..67ca3a4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm 22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..c9fa273 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -51,6 +51,7 @@ sys_sbrk(void)
+ uint64
+ sys_sleep(void)
+ {
++  backtrace();
+   int n;
+   uint ticks0;
+ 
+@@ -91,3 +92,28 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_sigalarm(void)
++{
++  int interal;
++  uint64 userfunc;
++  argint(0, &interal);
++  argaddr(1, &userfunc);
++  struct proc *p = myproc();
++  p->interval = interal;
++  p->ticks_passed = 0;
++  p->userfunc = userfunc;
++  return 0;
++}
++
++uint64
++sys_sigreturn()
++{
++  struct proc *p = myproc();
++  if (p->interval > 0) {
++      memmove(p->trapframe, p->alarm_frame, sizeof(struct trapframe));
++      p->userfunc_running = 0;
++  }
++  return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..41b0909 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,8 +77,18 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  if(which_dev == 2) {
++    if (p->interval > 0) {
++      p->ticks_passed++;
++      if (p->ticks_passed >= p->interval && p->userfunc_running == 0) {
++          p->ticks_passed = 0;
++          memmove(p->alarm_frame, p->trapframe, sizeof(struct trapframe));
++          p->trapframe->epc = p->userfunc;
++          p->userfunc_running = 1;
++      }
++    }
+     yield();
++  }
+ 
+   usertrapret();
+ }
+@@ -151,8 +161,9 @@ kerneltrap()
+   }
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
++  if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING) {
+     yield();
++  }
+ 
+   // the yield() may have caused some traps to occur,
+   // so restore trap registers for use by kernelvec.S's sepc instruction.
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..3d94029 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int, void (*handler)());
++int sigreturn();
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fa548b0 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
